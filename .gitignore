@@ -1,4 +1,4 @@
-# Runtime data (stored in ~/.local/share/vocr/, not here)
+# Runtime data
 venv/
 models/
 server.pid

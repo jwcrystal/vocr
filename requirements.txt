@@ -1,0 +1,7 @@
+# venv dependencies (for layout detection)
+onnxruntime>=1.27.0
+opencv-python>=5.0.0
+numpy>=2.5.0
+
+# mlx-vlm is installed globally via: uv tool install mlx-vlm
+# It is NOT listed here because it requires Apple Silicon MLX framework
