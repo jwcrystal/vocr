@@ -22,6 +22,7 @@ SCRIPT_REAL="$(readlink -f "$0" 2>/dev/null || python3 -c "import os,sys; print(
 DATA_DIR="$(cd "$(dirname "$SCRIPT_REAL")/.." && pwd)"
 PID_FILE="$DATA_DIR/server.pid"
 LOG_FILE="$DATA_DIR/server.log"
+PROFILE_FILE="$DATA_DIR/server.profile"
 
 mkdir -p "$DATA_DIR"
 
@@ -52,6 +53,7 @@ case "${1:-status}" in
       exit 0
     fi
     echo "Starting server (model: $MODEL, port: $PORT)..."
+    echo "$PROFILE" > "$PROFILE_FILE"
     mlx_vlm.server --model "$MODEL" --port "$PORT" --host 127.0.0.1 \
       > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
@@ -74,7 +76,7 @@ case "${1:-status}" in
       kill "$PID" 2>/dev/null || true
       sleep 1
       kill -9 "$PID" 2>/dev/null || true
-      rm -f "$PID_FILE"
+      rm -f "$PID_FILE" "$PROFILE_FILE"
       echo "Stopped"
     else
       echo "Not running"
@@ -90,9 +92,17 @@ case "${1:-status}" in
 
   status)
     if is_running; then
-      echo "Running (PID: $(cat "$PID_FILE"), port: $PORT, model: $MODEL)"
+      SAVED_PROFILE="paddleocr-vl"
+      [[ -f "$PROFILE_FILE" ]] && SAVED_PROFILE=$(cat "$PROFILE_FILE")
+      case "$SAVED_PROFILE" in
+        paddleocr-vl) SAVED_MODEL="PaddlePaddle/PaddleOCR-VL-1.6" ;;
+        glm-ocr)      SAVED_MODEL="mlx-community/GLM-OCR-bf16" ;;
+        *)            SAVED_MODEL="$SAVED_PROFILE" ;;
+      esac
+      echo "Running (PID: $(cat "$PID_FILE"), port: $PORT, model: $SAVED_MODEL)"
     else
       echo "Not running"
+      rm -f "$PROFILE_FILE"
       exit 1
     fi
     ;;
