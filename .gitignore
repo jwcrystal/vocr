@@ -1,0 +1,12 @@
+# Runtime data (stored in ~/.local/share/vocr/, not here)
+venv/
+models/
+server.pid
+server.log
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
