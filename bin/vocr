@@ -1,0 +1,467 @@
+#!/Users/jwang/Documents/Workspace/vocr/venv/bin/python3
+"""vocr — unified document OCR with layout-aware mode.
+
+Usage:
+  vocr IMG.png                  # OCR (auto: server or subprocess)
+  vocr IMG.png --table          # table → markdown
+  vocr IMG.png --formula        # formula → LaTeX
+  vocr IMG.png --layout         # layout detect + per-region OCR
+  vocr IMG.png --layout --dry-run  # show regions only
+  vocr IMG1.png IMG2.png        # batch
+  vocr IMG.png --extract invoice_number,issue_date,buyer_name  # structured extraction
+  vocr IMG.png --ask "這張發票的總金額是多少？"               # Q&A
+
+Requires: vocr-server start (optional, for fast inference)
+Fallback: subprocess mlx_vlm.generate (slower, auto-detected)
+
+--extract requires LLM env vars:
+  VOCR_LLM_API   e.g. https://api.openai.com/v1/chat/completions
+  VOCR_LLM_KEY   e.g. sk-...
+  VOCR_LLM_MODEL e.g. gpt-4o-mini
+"""
+
+import base64
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import urllib.request
+
+# ── Auto-load secrets ───────────────────────────────────
+
+def _load_env():
+    for p in [Path.home() / ".secrets/local.env", Path.home() / ".env"]:
+        if not p.is_file():
+            continue
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.replace("export ", "").strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+
+_load_env()
+
+# ── Config ──────────────────────────────────────────────
+
+PORT = int(os.environ.get("VOCR_PORT", "8765"))
+MODEL = os.environ.get("VOCR_MODEL", "PaddlePaddle/PaddleOCR-VL-1.6")
+MAX_TOKENS = int(os.environ.get("VOCR_MAX_TOKENS", "4000"))
+
+# All paths relative to project root
+_PROJECT = Path(__file__).resolve().parent.parent
+_DATA_DIR = _PROJECT
+LAYOUT_MODEL = str(_DATA_DIR / "models/PP-DocLayoutV3.onnx")
+PARSER_PATH = str(_PROJECT / "lib/paddleocr_vl.py")
+THRESHOLD = 0.5
+
+# ── Server detection ────────────────────────────────────
+
+def server_available() -> bool:
+    try:
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{PORT}/v1/models", timeout=1
+        )
+        return True
+    except Exception:
+        return False
+
+
+# ── OCR backends ────────────────────────────────────────
+
+def ocr_server(image_path: str, prompt: str) -> str:
+    """Call mlx_vlm.server HTTP API."""
+    with open(image_path, "rb") as f:
+        ext = Path(image_path).suffix.lstrip(".") or "png"
+        img_b64 = base64.b64encode(f.read()).decode()
+
+    data = {
+        "model": MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/{ext};base64,{img_b64}"}},
+                {"type": "text", "text": prompt},
+            ]
+        }],
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0,
+    }
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PORT}/v1/chat/completions",
+        data=json.dumps(data).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        result = json.loads(resp.read())
+
+    return result["choices"][0]["message"]["content"].strip()
+
+
+def ocr_subprocess(image_path: str, prompt: str) -> str:
+    """Fallback: call mlx_vlm.generate CLI."""
+    result = subprocess.run(
+        ["mlx_vlm.generate", "--model", MODEL, "--image", image_path,
+         "--prompt", prompt, "--max-tokens", str(MAX_TOKENS)],
+        capture_output=True, text=True, timeout=300,
+    )
+    output = result.stdout
+    if "Assistant:" in output:
+        start = output.index("Assistant:") + len("Assistant:")
+        rest = output[start:]
+        end = rest.index("==========") if "==========" in rest else len(rest)
+        return rest[:end].strip()
+    return output.strip()
+
+
+def ocr(image_path: str, prompt: str) -> str:
+    """Auto-detect server vs subprocess."""
+    if server_available():
+        return ocr_server(image_path, prompt)
+    return ocr_subprocess(image_path, prompt)
+
+
+# ── Table parsing ───────────────────────────────────────
+
+def parse_table(raw: str) -> str:
+    proc = subprocess.run(
+        [sys.executable, PARSER_PATH],
+        input=raw, capture_output=True, text=True,
+    )
+    return proc.stdout.strip() or raw
+
+
+# ── Layout detection ────────────────────────────────────
+
+LABELS = [
+    "abstract", "algorithm", "aside_text", "chart", "content",
+    "display_formula", "doc_title", "figure_title", "footer", "footer_image",
+    "footnote", "formula_number", "header", "header_image", "image",
+    "inline_formula", "number", "paragraph_title", "reference", "reference_content",
+    "seal", "table", "text", "vertical_text", "vision_footnote",
+]
+
+SPECIAL_PROMPTS = {
+    "table": "Table Recognition:",
+    "display_formula": "Formula Recognition:",
+    "inline_formula": "Formula Recognition:",
+    "chart": "Chart Recognition:",
+    "seal": "Seal Recognition:",
+}
+
+MD_PREFIX = {"doc_title": "# ", "paragraph_title": "## "}
+MD_SUFFIX: dict = {}
+
+
+def detect_layout(image_path: str, threshold: float = THRESHOLD):
+    import cv2
+    import numpy as np
+    import onnxruntime as ort
+
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Cannot read: {image_path}")
+
+    orig_h, orig_w = image.shape[:2]
+    resized = cv2.resize(image, (800, 800), interpolation=cv2.INTER_LINEAR)
+    blob = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    blob = (blob - mean) / std
+    blob = blob.transpose(2, 0, 1)[np.newaxis, ...]
+    scale_h, scale_w = 800 / orig_h, 800 / orig_w
+
+    session = ort.InferenceSession(LAYOUT_MODEL, providers=["CPUExecutionProvider"])
+    names_in = [i.name for i in session.get_inputs()]
+    names_out = [o.name for o in session.get_outputs()]
+
+    feed = {
+        names_in[0]: np.array([[800, 800]], dtype=np.float32),
+        names_in[1]: blob,
+        names_in[2]: np.array([[scale_h, scale_w]], dtype=np.float32),
+    }
+    output = session.run(names_out, feed)[0]
+
+    mask = output[:, 1] > threshold
+    boxes = output[mask]
+    if len(boxes) > 0 and boxes.shape[1] >= 7:
+        boxes = boxes[np.argsort(boxes[:, 6].astype(int))]
+
+    regions = []
+    for box in boxes:
+        cls_id = int(box[0])
+        score = float(box[1])
+        x1, y1, x2, y2 = float(box[2]), float(box[3]), float(box[4]), float(box[5])
+        label = LABELS[cls_id] if cls_id < len(LABELS) else f"class_{cls_id}"
+        regions.append({
+            "label": label, "score": round(score, 3),
+            "bbox": [max(0, int(x1)), max(0, int(y1)), min(orig_w, int(x2)), min(orig_h, int(y2))],
+        })
+
+    return regions, image
+
+
+def ocr_with_layout(image_path: str, dry_run: bool = False) -> str:
+    import cv2
+
+    regions, image = detect_layout(image_path)
+
+    if dry_run:
+        lines = ["# Detected Regions", ""]
+        for i, r in enumerate(regions):
+            lines.append(f"{i+1}. **{r['label']}** (score: {r['score']}) — {r['bbox']}")
+        return "\n".join(lines)
+
+    # Split regions: special types (table/formula/chart) vs text
+    special = [r for r in regions if r["label"] in SPECIAL_PROMPTS]
+    text_like = [r for r in regions if r["label"] not in SPECIAL_PROMPTS
+                 and r["label"] not in ("header_image", "footer_image", "image")]
+
+    results = []
+
+    # 1. Whole-image OCR for all text regions at once
+    if text_like:
+        raw = ocr(image_path, "OCR:")
+        results.append(raw)
+
+    # 2. Per-region OCR for special types
+    tmpdir = tempfile.mkdtemp(prefix="vocr_")
+    for r in special:
+        x1, y1, x2, y2 = r["bbox"]
+        crop = image[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        crop_path = str(Path(tmpdir) / f"{r['label']}.png")
+        cv2.imwrite(crop_path, crop)
+
+        prompt = SPECIAL_PROMPTS[r["label"]]
+        raw = ocr(crop_path, prompt)
+
+        if r["label"] == "table":
+            raw = parse_table(raw)
+
+        prefix = MD_PREFIX.get(r["label"], "")
+        results.append(f"{prefix}{raw}")
+
+    return "\n\n".join(results)
+
+
+# ── LLM field extraction ────────────────────────────────
+
+def extract_fields(ocr_text: str, fields: list) -> str:
+    """Send OCR text to LLM, extract structured fields as JSON."""
+    api_url = os.environ.get("VOCR_LLM_API", "")
+    api_key = os.environ.get("VOCR_LLM_KEY", "")
+    model = os.environ.get("VOCR_LLM_MODEL", "gpt-4o-mini")
+
+    if not api_url:
+        print("Error: set VOCR_LLM_API, VOCR_LLM_KEY, VOCR_LLM_MODEL", file=sys.stderr)
+        print("  export VOCR_LLM_API=https://api.openai.com/v1/chat/completions", file=sys.stderr)
+        print("  export VOCR_LLM_KEY=sk-...", file=sys.stderr)
+        print("  export VOCR_LLM_MODEL=gpt-4o-mini", file=sys.stderr)
+        sys.exit(1)
+
+    field_list = ", ".join(fields)
+    schema = {f: "" for f in fields}
+
+    prompt = f"""Extract the following fields from this OCR text.
+Return ONLY valid JSON. Use null for fields not found.
+
+Fields: {field_list}
+
+OCR Text:
+{ocr_text}
+
+Return JSON in this exact format: {json.dumps(schema, indent=2)}
+Replace empty strings with actual values or null."""
+
+    data = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+    }
+
+    headers = {"Content-Type": "application/json", "User-Agent": "vocr/1.0"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(
+        api_url,
+        data=json.dumps(data).encode(),
+        headers=headers,
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+        content = result["choices"][0]["message"]["content"].strip()
+
+        # Strip markdown code fences if present
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1] if "\n" in content else content
+            if content.endswith("```"):
+                content = content.rsplit("```", 1)[0]
+            content = content.strip()
+
+        # Validate JSON
+        parsed = json.loads(content)
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f'{{"error": "LLM extraction failed: {e}"}}'
+
+
+def ask_question(ocr_text: str, question: str) -> str:
+    """Send OCR text + user question to LLM, return natural language answer."""
+    api_url = os.environ.get("VOCR_LLM_API", "")
+    api_key = os.environ.get("VOCR_LLM_KEY", "")
+    model = os.environ.get("VOCR_LLM_MODEL", "gpt-4o-mini")
+
+    if not api_url:
+        print("Error: set VOCR_LLM_API, VOCR_LLM_KEY, VOCR_LLM_MODEL", file=sys.stderr)
+        sys.exit(1)
+
+    prompt = f"""Here is the OCR text extracted from an image:
+
+{ocr_text}
+
+User question: {question}
+
+Answer based on ALL the information in the OCR text above. Be comprehensive — include details, steps, names, numbers, and structure as relevant. Do not give one-line answers."""
+
+    data = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant analyzing document OCR text. Always give thorough, detailed answers. Respond in the same language as the question."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 4000,
+        "temperature": 0,
+    }
+
+    headers = {"Content-Type": "application/json", "User-Agent": "vocr/1.0"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(
+        api_url,
+        data=json.dumps(data).encode(),
+        headers=headers,
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+        return result["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"Error: LLM request failed: {e}"
+
+
+# ── CLI ─────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    mode = "ocr"
+    prompt_override = None
+    dry_run = False
+    extract_fields_list = None
+    ask_question_text = None
+    images = []
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return
+        elif a == "--table":
+            mode = "table"
+        elif a == "--formula":
+            mode = "formula"
+        elif a == "--chart":
+            mode = "chart"
+        elif a == "--spotting":
+            mode = "spotting"
+        elif a == "--raw":
+            mode = "raw"
+        elif a == "--layout":
+            mode = "layout"
+        elif a == "--dry-run":
+            dry_run = True
+        elif a == "--extract":
+            extract_fields_list = [f.strip() for f in args[i + 1].split(",")]
+            i += 1
+        elif a == "--ask":
+            ask_question_text = args[i + 1]
+            i += 1
+        elif a == "--prompt":
+            prompt_override = args[i + 1]
+            i += 1
+        elif a == "--model":
+            global MODEL
+            MODEL = args[i + 1]
+            i += 1
+        elif a == "--tokens":
+            global MAX_TOKENS
+            MAX_TOKENS = int(args[i + 1])
+            i += 1
+        else:
+            images.append(a)
+        i += 1
+
+    if not images:
+        print("Usage: vocr IMG.png [--table|--formula|--layout|--chart]", file=sys.stderr)
+        sys.exit(1)
+
+    backend = "server" if server_available() else "subprocess"
+    print(f"[backend: {backend}]", file=sys.stderr)
+
+    prompts = {
+        "ocr": "OCR:",
+        "table": "Table Recognition:",
+        "formula": "Formula Recognition:",
+        "chart": "Chart Recognition:",
+        "spotting": "Spotting:",
+        "raw": "OCR:",
+    }
+
+    first = True
+    for img in images:
+        if not os.path.isfile(img):
+            print(f"Error: not found: {img}", file=sys.stderr)
+            continue
+
+        if not first:
+            print("\n---\n")
+        first = False
+
+        if len(images) > 1:
+            print(f"**{Path(img).name}**\n")
+
+        if mode == "layout":
+            output = ocr_with_layout(img, dry_run=dry_run)
+        else:
+            prompt = prompt_override or prompts.get(mode, "OCR:")
+            output = ocr(img, prompt)
+            if mode == "table":
+                output = parse_table(output)
+
+        if extract_fields_list and not dry_run:
+            result = extract_fields(output, extract_fields_list)
+            print(result)
+        elif ask_question_text and not dry_run:
+            result = ask_question(output, ask_question_text)
+            print(result)
+        else:
+            print(output)
+
+
+if __name__ == "__main__":
+    main()
