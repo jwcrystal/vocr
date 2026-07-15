@@ -17,7 +17,9 @@ case "$PROFILE" in
   glm-ocr)      MODEL="mlx-community/GLM-OCR-bf16" ;;
   *)            MODEL="$VOCR_PROFILE" ;;  # treat as raw model name
 esac
-DATA_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolve symlink to get real project directory
+SCRIPT_REAL="$(readlink -f "$0" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$0")"
+DATA_DIR="$(cd "$(dirname "$SCRIPT_REAL")/.." && pwd)"
 PID_FILE="$DATA_DIR/server.pid"
 LOG_FILE="$DATA_DIR/server.log"
 
