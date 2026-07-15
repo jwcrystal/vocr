@@ -1,6 +1,32 @@
 # vocr — PaddleOCR-VL Document OCR Tool
 
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.12+-green.svg)
+![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-silver.svg)
+![Model](https://img.shields.io/badge/model-PaddleOCR--VL%201.6-orange.svg)
+![ONNX](https://img.shields.io/badge/layout-PP--DocLayoutV3-red.svg)
+![Status](https://img.shields.io/badge/status-active-brightgreen.svg)
+
 Local document OCR pipeline for macOS (Apple Silicon). Combines PaddleOCR-VL (via MLX) for text recognition with PP-DocLayoutV3 (ONNX) for layout detection, plus optional LLM layer for semantic understanding.
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Components](#components)
+- [Directory Structure](#directory-structure)
+- [Setup](#setup)
+- [Usage](#usage)
+  - [Server](#server)
+  - [OCR Modes](#ocr-modes)
+  - [Semantic Modes](#semantic-modes-requires-llm-config)
+  - [Custom Options](#custom-options)
+- [Performance](#performance)
+- [PaddleOCR-VL Prompts](#paddleocr-vl-prompts)
+- [Dependencies](#dependencies)
+- [Files](#files)
+- [Model Sources](#model-sources)
+- [Layout Detection Labels](#layout-detection-labels)
+- [License](#license)
 
 ## Architecture
 
@@ -172,3 +198,7 @@ PP-DocLayoutV3 detects 25 region types. Key mappings:
 | chart | `Chart Recognition:` | Cropped |
 | seal | `Seal Recognition:` | Cropped |
 | image, header_image, footer_image | `OCR:` | May contain text (diagrams) |
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 jwcrystal
