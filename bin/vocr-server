@@ -10,7 +10,13 @@
 set -euo pipefail
 
 PORT="${VOCR_PORT:-8765}"
-MODEL="${VOCR_MODEL:-PaddlePaddle/PaddleOCR-VL-1.6}"
+PROFILE="${VOCR_PROFILE:-paddleocr-vl}"
+
+case "$PROFILE" in
+  paddleocr-vl) MODEL="PaddlePaddle/PaddleOCR-VL-1.6" ;;
+  glm-ocr)      MODEL="mlx-community/GLM-OCR-bf16" ;;
+  *)            MODEL="$VOCR_PROFILE" ;;  # treat as raw model name
+esac
 DATA_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PID_FILE="$DATA_DIR/server.pid"
 LOG_FILE="$DATA_DIR/server.log"
