@@ -481,6 +481,14 @@ def main():
         print(f"Error: unknown profile '{profile_name}'. Available: {', '.join(PROFILES.keys())}", file=sys.stderr)
         sys.exit(1)
 
+    # Auto-sync profile with running server
+    if "--profile" not in args and server_available():
+        profile_file = _PROJECT / "server.profile"
+        if profile_file.exists():
+            server_profile = profile_file.read_text().strip()
+            if server_profile in PROFILES:
+                profile_name = server_profile
+
     profile = PROFILES[profile_name]
     model = profile["model"]
 
