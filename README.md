@@ -41,12 +41,6 @@ vocr/
 └── README.md
 ```
 
-Global symlinks (in `~/.local/bin/`):
-```
-vocr        → ~/Documents/Workspace/vocr/bin/vocr
-vocr-server → ~/Documents/Workspace/vocr/bin/vocr-server
-```
-
 ## Setup
 
 ### 1. Install mlx-vlm (global)
@@ -70,11 +64,11 @@ mkdir -p models
 # Save to: models/PP-DocLayoutV3.onnx (124MB)
 ```
 
-### 4. Create symlinks
+### 4. (Optional) Create symlinks
 
 ```bash
-ln -sf ~/Documents/Workspace/vocr/bin/vocr ~/.local/bin/vocr
-ln -sf ~/Documents/Workspace/vocr/bin/vocr-server ~/.local/bin/vocr-server
+ln -sf <your-vocr-path>/bin/vocr ~/.local/bin/vocr
+ln -sf <your-vocr-path>/bin/vocr-server ~/.local/bin/vocr-server
 ```
 
 ### 5. (Optional) Configure LLM for --ask / --extract
