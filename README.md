@@ -1,16 +1,17 @@
-# vocr — PaddleOCR-VL Document OCR Tool
+# vocr — Multi-Model Document OCR Tool
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.12+-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-silver.svg)
-![Model](https://img.shields.io/badge/model-PaddleOCR--VL%201.6-orange.svg)
+![Models](https://img.shields.io/badge/models-PaddleOCR--VL%20%7C%20GLM--OCR-orange.svg)
 ![ONNX](https://img.shields.io/badge/layout-PP--DocLayoutV3-red.svg)
 ![Status](https://img.shields.io/badge/status-active-brightgreen.svg)
 
-Local document OCR pipeline for macOS (Apple Silicon). Combines PaddleOCR-VL (via MLX) for text recognition with PP-DocLayoutV3 (ONNX) for layout detection, plus optional LLM layer for semantic understanding.
+Local document OCR pipeline for macOS (Apple Silicon). Supports pluggable OCR models (PaddleOCR-VL, GLM-OCR) via MLX, with PP-DocLayoutV3 (ONNX) for layout detection and optional LLM layer for semantic understanding.
 
 ## Table of Contents
 
+- [Supported Models](#supported-models)
 - [Architecture](#architecture)
 - [Components](#components)
 - [Directory Structure](#directory-structure)
@@ -19,14 +20,28 @@ Local document OCR pipeline for macOS (Apple Silicon). Combines PaddleOCR-VL (vi
   - [Server](#server)
   - [OCR Modes](#ocr-modes)
   - [Semantic Modes](#semantic-modes-requires-llm-config)
+  - [Model Profiles](#model-profiles)
   - [Custom Options](#custom-options)
 - [Performance](#performance)
-- [PaddleOCR-VL Prompts](#paddleocr-vl-prompts)
+- [Prompt Reference](#prompt-reference)
 - [Dependencies](#dependencies)
 - [Files](#files)
 - [Model Sources](#model-sources)
 - [Layout Detection Labels](#layout-detection-labels)
 - [License](#license)
+
+## Supported Models
+
+| Profile | Model | Params | OmniDocBench | Memory | Notes |
+|---------|-------|--------|-------------|--------|-------|
+| `paddleocr-vl` (default) | `PaddlePaddle/PaddleOCR-VL-1.6` | 0.9B | 94.50 | ~4.1GB | Cell marker table parsing |
+| `glm-ocr` | `mlx-community/GLM-OCR-bf16` | 0.9B | 94.62 | ~3.6GB | Native output, lower memory |
+
+Switch models with `--profile`:
+
+```bash
+vocr IMG.png --profile glm-ocr
+```
 
 ## Architecture
 
@@ -43,10 +58,10 @@ Image
 
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
-| OCR engine | PaddleOCR-VL 0.9B via mlx-vlm | Text extraction from images |
+| OCR engine | PaddleOCR-VL / GLM-OCR via mlx-vlm | Text extraction (pluggable via profiles) |
 | Inference server | mlx_vlm.server | Keeps model in memory (1-2s/call vs 3-5s subprocess) |
 | Layout detection | PP-DocLayoutV3 ONNX (124MB) | Detects text/table/formula/chart regions |
-| Table parser | paddleocr_vl.py | Converts cell markers (`<fcel>`, `<lcel>`) to markdown |
+| Table parser | paddleocr_vl.py | Converts PaddleOCR-VL cell markers to markdown |
 | Semantic layer | External LLM API (OpenAI-compatible) | Q&A and structured field extraction |
 
 ## Directory Structure
@@ -54,7 +69,7 @@ Image
 ```
 vocr/
 ├── bin/
-│   ├── vocr              # Main CLI (Python, uses ./venv)
+│   ├── vocr              # Main CLI (Python, multi-model profiles)
 │   └── vocr-server       # Server manager (Bash)
 ├── lib/
 │   └── paddleocr_vl.py   # PaddleOCR-VL cell marker → markdown parser
@@ -118,7 +133,7 @@ vocr-server status    # Check status
 ### OCR modes
 
 ```bash
-vocr IMG.png                                    # Plain text OCR (~3s)
+vocr IMG.png                                    # Plain text OCR (~3s, default profile)
 vocr IMG.png --table                            # Table → markdown table
 vocr IMG.png --formula                          # Formula → LaTeX
 vocr IMG.png --layout                           # Layout detect + per-region OCR
@@ -134,11 +149,29 @@ vocr invoice.png --extract invoice_no,date,amt  # Structured JSON extraction
 vocr IMG.png --layout --ask "第三段的重點？"      # Layout + Q&A combined
 ```
 
+### Model Profiles
+
+```bash
+vocr IMG.png                                    # Default: paddleocr-vl
+vocr IMG.png --profile glm-ocr                  # Switch to GLM-OCR
+vocr IMG.png --profile paddleocr-vl             # Explicit paddleocr-vl
+
+# Server with specific profile
+VOCR_PROFILE=glm-ocr vocr-server start
+VOCR_PROFILE=glm-ocr vocr-server restart
+```
+
+Set default profile via env var:
+
+```bash
+export VOCR_PROFILE=glm-ocr   # all vocr calls use GLM-OCR by default
+```
+
 ### Custom options
 
 ```bash
-vocr IMG.png --prompt "Seal Recognition:"       # Custom PaddleOCR-VL prompt
-vocr IMG.png --model PaddlePaddle/PaddleOCR-VL-1.6  # Override model
+vocr IMG.png --prompt "Seal Recognition:"       # Custom prompt (overrides profile)
+vocr IMG.png --model PaddlePaddle/PaddleOCR-VL-1.6  # Override model directly
 vocr IMG.png --tokens 8000                      # Max tokens
 ```
 
@@ -153,16 +186,18 @@ vocr IMG.png --tokens 8000                      # Max tokens
 
 Without server: auto-fallback to subprocess. First call loads model (~4s), subsequent calls are faster due to OS cache.
 
-## PaddleOCR-VL Prompts
+## Prompt Reference
 
-| Prompt | Purpose |
-|--------|---------|
-| `OCR:` | General text recognition |
-| `Table Recognition:` | Table structure → cell markers |
-| `Formula Recognition:` | Mathematical formulas → LaTeX |
-| `Chart Recognition:` | Chart data extraction |
-| `Seal Recognition:` | Seal/stamp text |
-| `Spotting:` | Text detection + location |
+Each model profile uses different prompts:
+
+| Task | PaddleOCR-VL | GLM-OCR |
+|------|-------------|---------|
+| Text | `OCR:` | `Text Recognition:` |
+| Table | `Table Recognition:` | `Table Recognition:` |
+| Formula | `Formula Recognition:` | `Formula Recognition:` |
+| Chart | `Chart Recognition:` | `Chart Recognition:` |
+| Seal | `Seal Recognition:` | `Text Recognition:` |
+| Spotting | `Spotting:` | `Text Recognition:` |
 
 ## Dependencies
 
@@ -184,6 +219,7 @@ Without server: auto-fallback to subprocess. First call loads model (~4s), subse
 | Model | Source | Format |
 |-------|--------|--------|
 | PaddleOCR-VL 1.6 | `PaddlePaddle/PaddleOCR-VL-1.6` (HuggingFace) | HF safetensors (auto-loaded by mlx-vlm) |
+| GLM-OCR | `mlx-community/GLM-OCR-bf16` (HuggingFace) | MLX bf16 |
 | PP-DocLayoutV3 | `alex-dinh/PP-DocLayoutV3-ONNX` (HuggingFace) | ONNX |
 
 ## Layout Detection Labels
